@@ -35,54 +35,64 @@
 * Супергруппа с включенными топиками (темы)
 * Бот должен быть администратором группы с правами `Управление темами`
 
-## 🛠 Установка и запуск
+## 🛠 Установка
 
-### 1. Клонирование репозитория
+### 1. Подготовка Telegram
+
+1. Напишите [@BotFather](https://t.me/BotFather), создайте бота и скопируйте токен.
+2. Создайте группу (или используйте существующую), включите топики: **Настройки группы → Темы**.
+3. Добавьте бота в группу как администратора с правом **«Управление темами»**.
+4. Узнайте ID группы — перешлите любое сообщение из неё боту [@userinfobot](https://t.me/userinfobot). ID начинается с `-100`.
+
+### 2. Настройка конфигурации
 
 ```bash
-git clone https://github.com/gniloeapple/telegram-support-bot.git
-cd telegram-support-bot
-
+git clone https://github.com/v1rtezz/support-bot.git
+cd support-bot
 cp .env.example .env
 nano .env
 ```
 
-**Пример заполнения `.env`:**
+Заполните `.env`:
 
 ```ini
-TELEGRAM_TOKEN=123456789:AAH...             # Токен от BotFather
-SUPPORT_CHAT_ID=-1001234567890              # ID группы поддержки (начинается с -100)
+TELEGRAM_TOKEN=123456789:AAH...        # Токен от BotFather
+SUPPORT_CHAT_ID=-1001234567890         # ID группы поддержки 
 ```
 
-**Где взять данные:**
-
-* **TELEGRAM_TOKEN**: Напишите [@BotFather](https://t.me/BotFather), создайте нового бота и скопируйте выданный токен.
-* **SUPPORT_CHAT_ID**:
-  1. Создайте группу в Telegram, включите топики (Настройки → Темы).
-  2. Добавьте бота как администратора с правами `Управление темами`.
-  3. Используйте стороннего бота (например, `@userinfobot`), чтобы узнать ID группы.
-  4. ID начинается с `-100`.
-
-### 2. Создание виртуального окружения (рекомендуется)
+### 3. Деплой на VPS (Ubuntu/Debian)
 
 ```bash
-python -m venv venv
-# Активация для Windows:
-venv\Scripts\activate
-# Активация для Linux/macOS:
-source venv/bin/activate
+apt install -y python3.12-venv    # если ещё не установлен
+./deploy.sh
 ```
 
-### 3. Установка зависимостей
+Скрипт автоматически:
+- Создаст виртуальное окружение и установит зависимости
+- Настроит systemd-сервис `support-bot`
+- Запустит бота в фоне с автозапуском после перезагрузки
+
+### 4. Управление ботом
+
+| Команда | Описание |
+|---------|----------|
+| `sudo systemctl status support-bot` | Статус бота |
+| `sudo journalctl -u support-bot -f` | Логи в реальном времени |
+| `sudo systemctl restart support-bot` | Перезапуск (после изменения `.env` или кода) |
+| `sudo systemctl stop support-bot` | Остановка |
+
+Для обновления кода:
 
 ```bash
+git pull && ./deploy.sh
+```
+
+### Локальный запуск (для разработки)
+
+```bash
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 4. Запуск бота
-
-```bash
-python bot.py
+python3 bot.py
 ```
 
 ## 📖 Как использовать

@@ -416,6 +416,13 @@ async def create_or_reopen_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_
             f"🎫 Тикет: #{ticket_id}"
         )
         try:
+            # Первое сообщение (закрепляется автоматически) — служебное
+            await context.bot.send_message(
+                chat_id=SUPPORT_CHAT_ID,
+                message_thread_id=topic_id,
+                text="📩 Новое обращение"
+            )
+            # Второе — информация о пользователе (не пропадёт)
             await context.bot.send_message(
                 chat_id=SUPPORT_CHAT_ID,
                 message_thread_id=topic_id,
