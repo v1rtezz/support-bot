@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import sqlite3
 import logging
 import os
+import sys
 from datetime import datetime, timezone
-import pytz
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,7 +16,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
     CallbackQueryHandler,
-    ConversationHandler,
 )
 
 load_dotenv()
@@ -28,27 +30,30 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 
+# ---- Проверка обязательных переменных окружения ----
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
+_support_chat_id = os.getenv("SUPPORT_CHAT_ID")
 
-# Общий топик (используется в режиме single_topic)
-raw_topic_id = os.getenv("SUPPORT_TOPIC_ID")
-SUPPORT_TOPIC_ID = int(raw_topic_id) if raw_topic_id and raw_topic_id.strip().isdigit() else None
+if not TOKEN:
+    logger.error("TELEGRAM_TOKEN не задан в .env")
+    sys.exit(1)
+if not _support_chat_id:
+    logger.error("SUPPORT_CHAT_ID не задан в .env")
+    sys.exit(1)
 
-# Список админов из .env (через запятую)
-ADMINS = [int(admin_id.strip()) for admin_id in os.getenv("ADMINS", "").split(",") if admin_id.strip()]
+try:
+    SUPPORT_CHAT_ID = int(_support_chat_id)
+except ValueError:
+    logger.error(f"SUPPORT_CHAT_ID должен быть числом, получено: {_support_chat_id}")
+    sys.exit(1)
 
 # Временная зона МСК
-MSK = pytz.timezone('Europe/Moscow')
-
-# Состояния для ConversationHandler
-WAITING_GREETING, WAITING_HELP = range(2)
+MSK = ZoneInfo("Europe/Moscow")
 
 conn = sqlite3.connect("support_bot.db", check_same_thread=False)
-cursor = conn.cursor()
 
 # ---- таблица маппинга сообщений ----
-cursor.execute(
+conn.execute(
     """
 CREATE TABLE IF NOT EXISTS messages_mapping (
     user_chat_id       INTEGER,
@@ -60,8 +65,16 @@ CREATE TABLE IF NOT EXISTS messages_mapping (
 """
 )
 
+# ---- индекс для поиска по support_message_id ----
+conn.execute(
+    """
+CREATE INDEX IF NOT EXISTS idx_support_message_id
+ON messages_mapping (support_message_id)
+"""
+)
+
 # ---- таблица тикетов ----
-cursor.execute(
+conn.execute(
     """
 CREATE TABLE IF NOT EXISTS tickets (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +90,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 )
 
 # ---- таблица заблокированных пользователей ----
-cursor.execute(
+conn.execute(
     """
 CREATE TABLE IF NOT EXISTS blocked_users (
     user_chat_id INTEGER PRIMARY KEY,
@@ -87,58 +100,7 @@ CREATE TABLE IF NOT EXISTS blocked_users (
 """
 )
 
-# ---- таблица настроек бота ----
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS bot_settings (
-    setting_key   TEXT PRIMARY KEY,
-    setting_value TEXT NOT NULL
-)
-"""
-)
-
-# ---- МИГРАЦИЯ: Добавляем topic_id, если его нет ----
-def add_column_if_not_exists(table_name: str, column_name: str, column_type: str):
-    """Добавляет колонку в таблицу, если её ещё нет"""
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    columns = [row[1] for row in cursor.fetchall()]
-    
-    if column_name not in columns:
-        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
-        logger.info(f"Добавлена колонка {column_name} в таблицу {table_name}")
-    else:
-        logger.info(f"Колонка {column_name} уже существует в таблице {table_name}")
-
-add_column_if_not_exists("tickets", "topic_id", "INTEGER")
-
 conn.commit()
-
-
-# ----------------- Утилиты настроек -----------------
-def get_setting(key: str, default: str = "") -> str:
-    """Получает значение настройки из БД"""
-    cursor.execute("SELECT setting_value FROM bot_settings WHERE setting_key = ?", (key,))
-    row = cursor.fetchone()
-    return row[0] if row else default
-
-
-def set_setting(key: str, value: str):
-    """Сохраняет значение настройки в БД"""
-    cursor.execute(
-        "INSERT OR REPLACE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
-        (key, value),
-    )
-    conn.commit()
-
-
-def get_topic_mode() -> str:
-    """Возвращает режим топиков: 'per_user' или 'single_topic'"""
-    return get_setting("topic_mode", "per_user")
-
-
-def set_topic_mode(mode: str):
-    """Устанавливает режим топиков"""
-    set_setting("topic_mode", mode)
 
 
 # Дефолтные тексты
@@ -155,6 +117,9 @@ DEFAULT_HELP = (
     "⌛️ Возможно придётся подождать некоторое время, прежде чем вы получите ответ на свой вопрос."
 )
 
+MAX_CAPTION_LENGTH = 1024
+MAX_MESSAGE_LENGTH = 4096
+
 
 # ----------------- Утилиты -----------------
 def format_datetime(iso_string: str) -> str:
@@ -169,30 +134,191 @@ def format_datetime(iso_string: str) -> str:
         return iso_string
 
 
-def is_admin(user_id: int) -> bool:
-    """Проверяет, является ли пользователь админом"""
-    return user_id in ADMINS
+def truncate(text: str, limit: int) -> str:
+    """Обрезает текст до limit символов, добавляя '…' если обрезан"""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _shift_entities(entities: tuple[MessageEntity, ...] | None, offset: int) -> list[MessageEntity] | None:
+    """Сдвигает offset всех entities на заданное значение."""
+    if not entities:
+        return None
+    shifted = []
+    for e in entities:
+        shifted.append(MessageEntity(
+            type=e.type,
+            offset=e.offset + offset,
+            length=e.length,
+            url=e.url,
+            user=e.user,
+            language=e.language,
+            custom_emoji_id=e.custom_emoji_id,
+        ))
+    return shifted
+
+
+async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
+    """Пересылает сообщение любого типа в указанный чат, сохраняя форматирование и premium emoji.
+
+    caption — header, добавляемый к медиа/тексту (обрезается до лимитов).
+    Entities корректно сдвигаются при добавлении header.
+    """
+    bot = message.get_bot()
+
+    if message.text:
+        if caption:
+            prefix = f"{caption}\n\n"
+            text = prefix + message.text
+            entities = _shift_entities(message.entities, len(prefix))
+        else:
+            text = message.text
+            entities = message.entities
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=truncate(text, MAX_MESSAGE_LENGTH),
+            entities=entities,
+            **kwargs,
+        )
+    elif message.photo:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_photo(
+            chat_id=chat_id,
+            photo=message.photo[-1].file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.video:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_video(
+            chat_id=chat_id,
+            video=message.video.file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.animation:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_animation(
+            chat_id=chat_id,
+            animation=message.animation.file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.document:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_document(
+            chat_id=chat_id,
+            document=message.document.file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.voice:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_voice(
+            chat_id=chat_id,
+            voice=message.voice.file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.audio:
+        if caption and message.caption:
+            prefix = f"{caption}\n\n"
+            full_cap = prefix + message.caption
+            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+        else:
+            full_cap = caption or message.caption or ""
+            cap_entities = message.caption_entities if not caption else None
+        return await bot.send_audio(
+            chat_id=chat_id,
+            audio=message.audio.file_id,
+            caption=truncate(full_cap, MAX_CAPTION_LENGTH),
+            caption_entities=cap_entities,
+            **kwargs,
+        )
+    elif message.video_note:
+        return await bot.send_video_note(
+            chat_id=chat_id,
+            video_note=message.video_note.file_id,
+            **kwargs,
+        )
+    elif message.sticker:
+        return await bot.send_sticker(
+            chat_id=chat_id,
+            sticker=message.sticker.file_id,
+            **kwargs,
+        )
+    elif message.contact:
+        return await bot.send_contact(
+            chat_id=chat_id,
+            phone_number=message.contact.phone_number,
+            first_name=message.contact.first_name,
+            last_name=message.contact.last_name or "",
+            **kwargs,
+        )
+    elif message.location:
+        return await bot.send_location(
+            chat_id=chat_id,
+            latitude=message.location.latitude,
+            longitude=message.location.longitude,
+            **kwargs,
+        )
+    else:
+        return None
 
 
 # ----------------- Работа с БД / Блокировка -----------------
 
 def is_user_blocked(user_chat_id: int) -> bool:
     """Проверяет, заблокирован ли пользователь"""
-    cursor.execute("SELECT 1 FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
-    return cursor.fetchone() is not None
+    row = conn.execute("SELECT 1 FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,)).fetchone()
+    return row is not None
 
 
 def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
-    """
-    Блокирует или разблокирует пользователя.
-    """
+    """Блокирует или разблокирует пользователя."""
     if is_user_blocked(user_chat_id):
-        cursor.execute("DELETE FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
+        conn.execute("DELETE FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
         conn.commit()
         return False
     else:
         now = datetime.now(timezone.utc).isoformat()
-        cursor.execute(
+        conn.execute(
             "INSERT INTO blocked_users (user_chat_id, blocked_at, admin_id) VALUES (?, ?, ?)",
             (user_chat_id, now, admin_id),
         )
@@ -203,7 +329,7 @@ def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
 # ----------------- Работа с БД / тикетами -----------------
 def get_open_ticket(user_chat_id: int):
     """Возвращает ID и topic_id открытого тикета пользователя"""
-    cursor.execute(
+    row = conn.execute(
         """
         SELECT id, topic_id FROM tickets
         WHERE user_chat_id = ? AND status = 'open'
@@ -211,35 +337,66 @@ def get_open_ticket(user_chat_id: int):
         LIMIT 1
         """,
         (user_chat_id,),
-    )
-    row = cursor.fetchone()
+    ).fetchone()
     return row if row else None
 
 
-async def create_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, username: str = None, first_name: str = None) -> tuple:
-    """Создает тикет и топик в форуме (если режим per_user)"""
+def get_last_closed_ticket(user_chat_id: int):
+    """Возвращает ID и topic_id последнего закрытого тикета пользователя"""
+    row = conn.execute(
+        """
+        SELECT id, topic_id FROM tickets
+        WHERE user_chat_id = ? AND status = 'closed' AND topic_id IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_chat_id,),
+    ).fetchone()
+    return row if row else None
+
+
+def get_ticket_by_topic_id(topic_id: int):
+    """Возвращает открытый тикет по topic_id"""
+    row = conn.execute(
+        "SELECT id, user_chat_id FROM tickets WHERE topic_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+        (topic_id,),
+    ).fetchone()
+    return row if row else None
+
+
+async def create_or_reopen_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, username: str = None, first_name: str = None) -> tuple:
+    """Создает новый тикет или переоткрывает последний закрытый (переиспользуя топик)."""
     now = datetime.now(timezone.utc).isoformat()
-    topic_mode = get_topic_mode()
-    
+
+    # Пробуем переиспользовать закрытый тикет с существующим топиком
+    closed = get_last_closed_ticket(user_chat_id)
+    if closed:
+        ticket_id, topic_id = closed
+        conn.execute(
+            "UPDATE tickets SET status = 'open', updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+        conn.commit()
+        await update_topic_status(context, ticket_id, "open")
+        logger.info(f"Переоткрыт тикет #{ticket_id} (топик {topic_id}) для пользователя {user_chat_id}")
+        return ticket_id, topic_id
+
+    # Нет закрытого тикета — создаём новый топик
     topic_id = None
-    
-    # Создаем отдельный топик только в режиме per_user
-    if topic_mode == "per_user":
-        display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
-        topic_name = f"🟢 {display_name}"
-        
-        try:
-            forum_topic = await context.bot.create_forum_topic(
-                chat_id=SUPPORT_CHAT_ID,
-                name=topic_name[:128]
-            )
-            topic_id = forum_topic.message_thread_id
-            logger.info(f"Создан топик {topic_id} для пользователя {user_chat_id}")
-        except Exception as e:
-            logger.error(f"Ошибка создания топика: {e}")
-    
-    # Сохраняем тикет с topic_id
-    cursor.execute(
+    display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
+    topic_name = f"🟢 {display_name}"
+
+    try:
+        forum_topic = await context.bot.create_forum_topic(
+            chat_id=SUPPORT_CHAT_ID,
+            name=topic_name[:128]
+        )
+        topic_id = forum_topic.message_thread_id
+        logger.info(f"Создан топик {topic_id} для пользователя {user_chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка создания топика: {e}")
+
+    conn.execute(
         """
         INSERT INTO tickets (user_chat_id, username, first_name, status, created_at, updated_at, topic_id)
         VALUES (?, ?, ?, 'open', ?, ?, ?)
@@ -247,10 +404,9 @@ async def create_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, u
         (user_chat_id, username, first_name, now, now, topic_id),
     )
     conn.commit()
-    ticket_id = cursor.lastrowid
-    
-    # Отправляем информацию о пользователе в топик (только для per_user режима)
-    if topic_mode == "per_user" and topic_id:
+    ticket_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    if topic_id:
         username_display = f"@{username}" if username else "Не указан"
         user_info = (
             f"👤 <b>Информация о пользователе</b>\n\n"
@@ -268,47 +424,57 @@ async def create_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, u
             )
         except Exception as e:
             logger.error(f"Ошибка отправки информации о пользователе: {e}")
-    
+
     return ticket_id, topic_id
 
 
 def update_ticket_status(ticket_id: int, status: str):
     """Обновляет статус тикета"""
     now = datetime.now(timezone.utc).isoformat()
-    cursor.execute(
-        """
-        UPDATE tickets
-        SET status = ?, updated_at = ?
-        WHERE id = ?
-        """,
+    conn.execute(
+        "UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
         (status, now, ticket_id),
     )
     conn.commit()
 
 
-async def update_topic_status(context: ContextTypes.DEFAULT_TYPE, ticket_id: int, status: str):
-    """Обновляет название топика при изменении статуса (только для per_user режима)"""
-    topic_mode = get_topic_mode()
-    if topic_mode != "per_user":
-        return
-    
-    cursor.execute(
-        """
-        SELECT topic_id, username, first_name, user_chat_id FROM tickets
-        WHERE id = ?
-        """,
-        (ticket_id,),
+def touch_ticket(ticket_id: int):
+    """Обновляет updated_at тикета"""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, ticket_id))
+    conn.commit()
+
+
+def update_ticket_user_info(ticket_id: int, username: str | None, first_name: str | None):
+    """Обновляет username и first_name в тикете"""
+    conn.execute(
+        "UPDATE tickets SET username = ?, first_name = ? WHERE id = ?",
+        (username, first_name, ticket_id),
     )
-    row = cursor.fetchone()
+    conn.commit()
+
+
+def get_ticket_status(ticket_id: int) -> str | None:
+    """Возвращает статус тикета"""
+    row = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    return row[0] if row else None
+
+
+async def update_topic_status(context: ContextTypes.DEFAULT_TYPE, ticket_id: int, status: str):
+    """Обновляет название топика при изменении статуса"""
+    row = conn.execute(
+        "SELECT topic_id, username, first_name, user_chat_id FROM tickets WHERE id = ?",
+        (ticket_id,),
+    ).fetchone()
     if not row or not row[0]:
         return
-    
+
     topic_id, username, first_name, user_chat_id = row
-    
+
     status_emoji = "🔴" if status == "closed" else "🟢"
     display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
     topic_name = f"{status_emoji} {display_name}"
-    
+
     try:
         await context.bot.edit_forum_topic(
             chat_id=SUPPORT_CHAT_ID,
@@ -321,19 +487,15 @@ async def update_topic_status(context: ContextTypes.DEFAULT_TYPE, ticket_id: int
 
 
 def get_ticket_by_support_message(support_message_id: int):
-    cursor.execute(
-        """
-        SELECT ticket_id FROM messages_mapping
-        WHERE support_message_id = ?
-        """,
+    row = conn.execute(
+        "SELECT ticket_id FROM messages_mapping WHERE support_message_id = ?",
         (support_message_id,),
-    )
-    row = cursor.fetchone()
+    ).fetchone()
     return row[0] if row else None
 
 
 def save_mapping(user_chat_id, user_message_id, support_message_id, ticket_id):
-    cursor.execute(
+    conn.execute(
         """
         INSERT OR REPLACE INTO messages_mapping (
             user_chat_id, user_message_id, support_message_id, ticket_id
@@ -346,19 +508,18 @@ def save_mapping(user_chat_id, user_message_id, support_message_id, ticket_id):
 
 
 def find_user_by_support_message(support_message_id):
-    cursor.execute(
+    return conn.execute(
         """
         SELECT user_chat_id, user_message_id, ticket_id
         FROM messages_mapping
         WHERE support_message_id = ?
         """,
         (support_message_id,),
-    )
-    return cursor.fetchone()
+    ).fetchone()
 
 
 def get_all_open_tickets(limit: int = 50):
-    cursor.execute(
+    return conn.execute(
         """
         SELECT id, user_chat_id, username, first_name, created_at, updated_at
         FROM tickets
@@ -367,32 +528,14 @@ def get_all_open_tickets(limit: int = 50):
         LIMIT ?
         """,
         (limit,),
-    )
-    return cursor.fetchall()
+    ).fetchall()
 
 
 def get_user_chat_id_by_ticket(ticket_id: int):
-    cursor.execute(
-        """
-        SELECT user_chat_id FROM tickets
-        WHERE id = ?
-        """,
+    row = conn.execute(
+        "SELECT user_chat_id FROM tickets WHERE id = ?",
         (ticket_id,),
-    )
-    row = cursor.fetchone()
-    return row[0] if row else None
-
-
-def get_topic_id_by_ticket(ticket_id: int):
-    """Возвращает topic_id по ID тикета"""
-    cursor.execute(
-        """
-        SELECT topic_id FROM tickets
-        WHERE id = ?
-        """,
-        (ticket_id,),
-    )
-    row = cursor.fetchone()
+    ).fetchone()
     return row[0] if row else None
 
 
@@ -400,17 +543,15 @@ def get_topic_id_by_ticket(ticket_id: int):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
-    
-    greeting_text = get_setting("greeting", DEFAULT_GREETING)
-    await update.message.reply_text(greeting_text)
+
+    await update.message.reply_text(DEFAULT_GREETING)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
 
-    help_text = get_setting("help", DEFAULT_HELP)
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(DEFAULT_HELP)
 
 
 async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,99 +564,40 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     ticket_data = get_open_ticket(user_chat_id)
-    new_ticket = False
-    
+
     if ticket_data is None:
-        ticket_id, topic_id = await create_ticket(context, user_chat_id, user.username, user.first_name)
-        new_ticket = True
+        ticket_id, topic_id = await create_or_reopen_ticket(context, user_chat_id, user.username, user.first_name)
         await message.reply_text(
-            f"✅ Ваш тикет #{ticket_id} создан. Оператор поддержки скоро ответит."
+            "Мы получили ваше обращение и скоро ответим \U0001F4AC",
+            entities=[
+                MessageEntity(
+                    type=MessageEntity.CUSTOM_EMOJI,
+                    offset=len("Мы получили ваше обращение и скоро ответим "),
+                    length=2,  # emoji занимает 2 символа (surrogate pair)
+                    custom_emoji_id="5244583512878648726",
+                ),
+            ],
         )
     else:
         ticket_id, topic_id = ticket_data
 
-    username = f"@{user.username}" if user.username else "Не указан"
-    
-    # В режиме single_topic показываем полную информацию о тикете
-    topic_mode = get_topic_mode()
-    if topic_mode == "single_topic" and new_ticket:
-        header = (
-            f"🎫 НОВЫЙ ТИКЕТ\n\n"
-            f"🆔 Тикет: {ticket_id}\n"
-            f"👤 Пользователь: {user.first_name or 'Не указано'}\n"
-            f"🆔 Telegram ID: {user.id}\n"
-            f"📱 Username: {username}"
-        )
-    else:
-        header = f"💬 {user.first_name or 'Не указано'} ({username}):"
+    # Обновляем данные пользователя на случай если сменились
+    update_ticket_user_info(ticket_id, user.username, user.first_name)
 
-    send_kwargs = {
-        "chat_id": SUPPORT_CHAT_ID,
-    }
-    
-    # Определяем куда отправлять сообщение
-    if topic_mode == "per_user" and topic_id:
-        # Режим отдельных топиков - используем topic_id из тикета
+    username = f"@{user.username}" if user.username else "Не указан"
+    header = f"💬 {user.first_name or 'Не указано'} ({username}):"
+
+    send_kwargs = {}
+    if topic_id:
         send_kwargs["message_thread_id"] = topic_id
-    elif topic_mode == "single_topic" and SUPPORT_TOPIC_ID:
-        # Режим общего топика - используем SUPPORT_TOPIC_ID
-        send_kwargs["message_thread_id"] = SUPPORT_TOPIC_ID
 
     keyboard = [
         [InlineKeyboardButton("❌ Заблокировать/Разблокировать", callback_data=f"block_{user_chat_id}")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    send_kwargs["reply_markup"] = reply_markup
-
-    sent_message = None
+    send_kwargs["reply_markup"] = InlineKeyboardMarkup(keyboard)
 
     try:
-        if message.photo:
-            cap = message.caption or ""
-            file_id = message.photo[-1].file_id
-            caption_text = f"{header}\n\n{cap}" if cap else header
-            sent_message = await context.bot.send_photo(
-                photo=file_id,
-                caption=caption_text,
-                **send_kwargs,
-            )
-        elif message.video:
-            cap = message.caption or ""
-            caption_text = f"{header}\n\n{cap}" if cap else header
-            sent_message = await context.bot.send_video(
-                video=message.video.file_id,
-                caption=caption_text,
-                **send_kwargs,
-            )
-        elif message.document:
-            cap = message.caption or ""
-            caption_text = f"{header}\n\n{cap}" if cap else header
-            sent_message = await context.bot.send_document(
-                document=message.document.file_id,
-                caption=caption_text,
-                **send_kwargs,
-            )
-        elif message.voice:
-            sent_message = await context.bot.send_voice(
-                voice=message.voice.file_id,
-                caption=header,
-                **send_kwargs,
-            )
-        elif message.audio:
-            cap = message.caption or ""
-            caption_text = f"{header}\n\n{cap}" if cap else header
-            sent_message = await context.bot.send_audio(
-                audio=message.audio.file_id,
-                caption=caption_text,
-                **send_kwargs,
-            )
-        elif message.text:
-            sent_message = await context.bot.send_message(
-                text=f"{header}\n\n{message.text}",
-                **send_kwargs,
-            )
-        else:
-            return
+        sent_message = await copy_message(message, SUPPORT_CHAT_ID, caption=header, **send_kwargs)
 
         if sent_message:
             save_mapping(
@@ -534,300 +616,39 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if message.chat_id != SUPPORT_CHAT_ID:
         return
-    if not message.reply_to_message:
+
+    # Игнорируем сообщения от самого бота
+    if message.from_user and message.from_user.id == context.bot.id:
         return
 
-    replied_msg = message.reply_to_message
-    found = find_user_by_support_message(replied_msg.message_id)
-    if not found:
+    user_chat_id = None
+    ticket_id = None
+
+    # Способ 1: ответ на конкретное сообщение — ищем по маппингу
+    if message.reply_to_message:
+        found = find_user_by_support_message(message.reply_to_message.message_id)
+        if found:
+            user_chat_id, _, ticket_id = found
+
+    # Способ 2: сообщение в топике без reply — ищем тикет по topic_id
+    if not user_chat_id and message.message_thread_id:
+        ticket_data = get_ticket_by_topic_id(message.message_thread_id)
+        if ticket_data:
+            ticket_id, user_chat_id = ticket_data
+
+    if not user_chat_id:
         return
 
-    user_chat_id, user_message_id, ticket_id = found
-    
     if is_user_blocked(user_chat_id):
         await message.reply_text("⛔️ Этот пользователь заблокирован. Он не получит сообщение.")
         return
 
     try:
-        if message.photo:
-            cap = message.caption or ""
-            await context.bot.send_photo(
-                chat_id=user_chat_id,
-                photo=message.photo[-1].file_id,
-                caption=cap,
-            )
-        elif message.video:
-            cap = message.caption or ""
-            await context.bot.send_video(
-                chat_id=user_chat_id,
-                video=message.video.file_id,
-                caption=cap,
-            )
-        elif message.document:
-            cap = message.caption or ""
-            await context.bot.send_document(
-                chat_id=user_chat_id,
-                document=message.document.file_id,
-                caption=cap,
-            )
-        elif message.voice:
-            await context.bot.send_voice(
-                chat_id=user_chat_id,
-                voice=message.voice.file_id,
-                caption=message.caption or "",
-            )
-        elif message.audio:
-            cap = message.caption or ""
-            await context.bot.send_audio(
-                chat_id=user_chat_id,
-                audio=message.audio.file_id,
-                caption=cap,
-            )
-        elif message.text:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text=message.text,
-            )
-
+        await copy_message(message, user_chat_id)
+        if ticket_id:
+            touch_ticket(ticket_id)
     except Exception as e:
         logger.error(f"Ошибка при отправке ответа пользователю: {e}")
-
-
-# ----------------- Админ-панель -----------------
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /admin - показывает админ-панель"""
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        return
-    
-    topic_mode = get_topic_mode()
-    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
-    
-    keyboard = [
-        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
-        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
-        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    msg = await update.message.reply_text(
-        "⚙️ Управление ботом",
-        reply_markup=reply_markup
-    )
-    context.user_data['admin_menu_message_id'] = msg.message_id
-    context.user_data['admin_menu_chat_id'] = msg.chat_id
-
-
-async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает админ-панель и завершает conversation"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        return ConversationHandler.END
-    
-    topic_mode = get_topic_mode()
-    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
-    
-    keyboard = [
-        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
-        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
-        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    menu_msg_id = context.user_data.get('admin_menu_message_id')
-    menu_chat_id = context.user_data.get('admin_menu_chat_id')
-    
-    if menu_msg_id and menu_chat_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=menu_chat_id,
-                message_id=menu_msg_id,
-                text="⚙️ Управление ботом",
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                logger.error(f"Ошибка редактирования меню: {e}")
-    
-    back_button_msg_id = context.user_data.get('back_button_message_id')
-    if back_button_msg_id and menu_chat_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=menu_chat_id,
-                message_id=back_button_msg_id
-            )
-        except Exception as e:
-            logger.error(f"Ошибка удаления кнопки: {e}")
-    
-    return ConversationHandler.END
-
-
-async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки в админ-панели"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    context.user_data['admin_menu_message_id'] = query.message.message_id
-    context.user_data['admin_menu_chat_id'] = query.message.chat_id
-    
-    back_keyboard = [
-        [InlineKeyboardButton("◀️ В меню", callback_data="admin_back_to_menu")]
-    ]
-    back_markup = InlineKeyboardMarkup(back_keyboard)
-    
-    if query.data == "admin_edit_greeting":
-        current_text = get_setting("greeting", DEFAULT_GREETING)
-        msg = await query.message.reply_text(
-            f"👉 Введите новое сообщение приветствия:\n\n"
-            f"<b>Текущее приветствие:</b>\n{current_text}",
-            parse_mode="HTML",
-            reply_markup=back_markup
-        )
-        context.user_data['back_button_message_id'] = msg.message_id
-        return WAITING_GREETING
-    
-    elif query.data == "admin_edit_help":
-        current_text = get_setting("help", DEFAULT_HELP)
-        msg = await query.message.reply_text(
-            f"👉 Введите новое сообщение помощи:\n\n"
-            f"<b>Текущая информация:</b>\n{current_text}",
-            parse_mode="HTML",
-            reply_markup=back_markup
-        )
-        context.user_data['back_button_message_id'] = msg.message_id
-        return WAITING_HELP
-    
-    elif query.data == "admin_toggle_mode":
-        # Переключаем режим топиков
-        current_mode = get_topic_mode()
-        new_mode = "single_topic" if current_mode == "per_user" else "per_user"
-        set_topic_mode(new_mode)
-        
-        mode_text = "📁 Отдельный топик для каждого пользователя" if new_mode == "per_user" else "📂 Общий топик для всех"
-        
-        keyboard = [
-            [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
-            [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
-            [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        try:
-            await query.edit_message_reply_markup(reply_markup=reply_markup)
-        except Exception as e:
-            logger.error(f"Ошибка обновления кнопок: {e}")
-
-
-async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняет новое приветственное сообщение"""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return ConversationHandler.END
-    
-    new_text = update.message.text
-    set_setting("greeting", new_text)
-    
-    await update.message.reply_text("✅ Приветственное сообщение успешно обновлено!")
-    
-    topic_mode = get_topic_mode()
-    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
-    
-    keyboard = [
-        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
-        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
-        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    menu_msg_id = context.user_data.get('admin_menu_message_id')
-    menu_chat_id = context.user_data.get('admin_menu_chat_id')
-    
-    if menu_msg_id and menu_chat_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=menu_chat_id,
-                message_id=menu_msg_id,
-                text="⚙️ Управление ботом",
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                logger.error(f"Ошибка редактирования меню: {e}")
-    
-    back_button_msg_id = context.user_data.get('back_button_message_id')
-    if back_button_msg_id and menu_chat_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=menu_chat_id,
-                message_id=back_button_msg_id
-            )
-        except Exception as e:
-            logger.error(f"Ошибка удаления кнопки: {e}")
-    
-    return ConversationHandler.END
-
-
-async def save_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняет новое сообщение помощи"""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return ConversationHandler.END
-    
-    new_text = update.message.text
-    set_setting("help", new_text)
-    
-    await update.message.reply_text("✅ Сообщение помощи успешно обновлено!")
-    
-    topic_mode = get_topic_mode()
-    mode_text = "📁 Отдельный топик для каждого" if topic_mode == "per_user" else "📂 Общий топик"
-    
-    keyboard = [
-        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
-        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
-        [InlineKeyboardButton(f"🔄 Режим: {mode_text}", callback_data="admin_toggle_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    menu_msg_id = context.user_data.get('admin_menu_message_id')
-    menu_chat_id = context.user_data.get('admin_menu_chat_id')
-    
-    if menu_msg_id and menu_chat_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=menu_chat_id,
-                message_id=menu_msg_id,
-                text="⚙️ Управление ботом",
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                logger.error(f"Ошибка редактирования меню: {e}")
-    
-    back_button_msg_id = context.user_data.get('back_button_message_id')
-    if back_button_msg_id and menu_chat_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=menu_chat_id,
-                message_id=back_button_msg_id
-            )
-        except Exception as e:
-            logger.error(f"Ошибка удаления кнопки: {e}")
-    
-    return ConversationHandler.END
-
-
-async def cancel_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена операции редактирования"""
-    await update.message.reply_text("❌ Операция отменена.")
-    return ConversationHandler.END
 
 
 # ----------------- Обработка кнопок -----------------
@@ -838,18 +659,20 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
     if not data.startswith("block_"):
         return
-    
+
     try:
         target_user_id = int(data.split("_")[1])
     except (IndexError, ValueError):
         return
-    
+
     admin_id = query.from_user.id
-    
+
     is_blocked_now = toggle_user_block(target_user_id, admin_id)
-    
-    cursor.execute("SELECT username, first_name FROM tickets WHERE user_chat_id = ? ORDER BY id DESC LIMIT 1", (target_user_id,))
-    res = cursor.fetchone()
+
+    res = conn.execute(
+        "SELECT username, first_name FROM tickets WHERE user_chat_id = ? ORDER BY id DESC LIMIT 1",
+        (target_user_id,),
+    ).fetchone()
     if res:
         username, first_name = res
         username_str = f"@{username}" if username else "без юзернейма"
@@ -882,22 +705,33 @@ async def open_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Открытых тикетов нет ✅")
         return
 
-    lines = ["📂 Открытые тикеты:\n"]
+    header = "📂 Открытые тикеты:\n\n"
+    blocks = []
     for ticket_id, user_chat_id, username, first_name, created_at, updated_at in rows:
         created_fmt = format_datetime(created_at)
         username_display = f"@{username}" if username else "Не указан"
         first_name_display = first_name or "Не указано"
-        
-        lines.append(
+
+        blocks.append(
             f"🎫 Тикет #{ticket_id}\n"
             f"👤 {first_name_display}\n"
             f"📱 {username_display}\n"
             f"🆔 ID: {user_chat_id}\n"
-            f"📅 Создан: {created_fmt}\n"
+            f"📅 Создан: {created_fmt}"
         )
 
-    text = "\n".join(lines)
-    await message.reply_text(text)
+    # Разбиваем на сообщения по целым блокам
+    current_text = header
+    for block in blocks:
+        candidate = current_text + block + "\n\n"
+        if len(candidate) > MAX_MESSAGE_LENGTH:
+            await message.reply_text(current_text.rstrip())
+            current_text = block + "\n\n"
+        else:
+            current_text = candidate
+
+    if current_text.strip():
+        await message.reply_text(current_text.rstrip())
 
 
 async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -913,12 +747,16 @@ async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Не удалось определить тикет для этого сообщения.")
         return
 
+    if get_ticket_status(ticket_id) == "closed":
+        await message.reply_text(f"Тикет #{ticket_id} уже закрыт.")
+        return
+
     user_chat_id = get_user_chat_id_by_ticket(ticket_id)
-    
+
     update_ticket_status(ticket_id, "closed")
     await update_topic_status(context, ticket_id, "closed")
     await message.reply_text(f"✅ Тикет #{ticket_id} закрыт.")
-    
+
     if user_chat_id:
         try:
             await context.bot.send_message(
@@ -942,6 +780,10 @@ async def reopen_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Не удалось определить тикет для этого сообщения.")
         return
 
+    if get_ticket_status(ticket_id) == "open":
+        await message.reply_text(f"Тикет #{ticket_id} уже открыт.")
+        return
+
     update_ticket_status(ticket_id, "open")
     await update_topic_status(context, ticket_id, "open")
     await message.reply_text(f"♻️ Тикет #{ticket_id} снова открыт.")
@@ -960,15 +802,10 @@ async def ticket_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Не удалось определить тикет для этого сообщения.")
         return
 
-    cursor.execute(
-        """
-        SELECT user_chat_id, status, created_at, updated_at
-        FROM tickets
-        WHERE id = ?
-        """,
+    row = conn.execute(
+        "SELECT user_chat_id, status, created_at, updated_at FROM tickets WHERE id = ?",
         (ticket_id,),
-    )
-    row = cursor.fetchone()
+    ).fetchone()
     if not row:
         await message.reply_text("Тикет не найден в базе.")
         return
@@ -976,7 +813,7 @@ async def ticket_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id, status, created_at, updated_at = row
     created_fmt = format_datetime(created_at)
     updated_fmt = format_datetime(updated_at)
-    
+
     is_blocked = is_user_blocked(user_chat_id)
     block_status = "ДА ⛔️" if is_blocked else "НЕТ ✅"
 
@@ -998,30 +835,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # ConversationHandler для админ-панели
-    admin_conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(admin_callback_handler, pattern="^admin_edit_")
-        ],
-        states={
-            WAITING_GREETING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_greeting),
-                CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
-            ],
-            WAITING_HELP: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_help),
-                CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel_admin),
-            CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
-        ],
-    )
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("admin", admin_command))
 
     # команды для операторов
     application.add_handler(CommandHandler("close", close_ticket_cmd))
@@ -1029,12 +844,6 @@ def main():
     application.add_handler(CommandHandler("ticket", ticket_info_cmd))
     application.add_handler(CommandHandler("open_tickets", open_tickets_cmd))
 
-    # Conversation handler для админки
-    application.add_handler(admin_conv_handler)
-
-    # Обработчик кнопки переключения режима топиков
-    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_toggle_mode$"))
-    
     # Обработчик нажатия на кнопку Block/Unblock
     application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_"))
 
@@ -1044,7 +853,12 @@ def main():
             forward_to_support,
         )
     )
-    application.add_handler(MessageHandler(filters.REPLY, reply_from_support))
+    application.add_handler(
+        MessageHandler(
+            filters.Chat(SUPPORT_CHAT_ID) & ~filters.COMMAND,
+            reply_from_support,
+        )
+    )
 
     application.add_error_handler(error_handler)
 
