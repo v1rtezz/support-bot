@@ -368,16 +368,16 @@ async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, user_chat_id: 
 
     username_display = f"@{username}" if username else "Не указан"
     user_info = (
-        f"🫡 <b>Братва, тут новый подъехал</b>\n\n"
+        f"🫡 <b>Досье на челика/b>\n\n"
         f"🆔 ID: <code>{user_chat_id}</code>\n"
-        f"👤 Погоняло: {first_name or 'Без имени'}\n"
+        f"👤 По паспорту: {first_name or 'аноним'}\n"
         f"📱 Юзер: {username_display}"
     )
     try:
         await context.bot.send_message(
             chat_id=SUPPORT_CHAT_ID,
             message_thread_id=topic_id,
-            text="🚨 Ало, на районе новый залётный",
+            text="🚨 Ало, работаем",
         )
         await context.bot.send_message(
             chat_id=SUPPORT_CHAT_ID,
@@ -440,7 +440,7 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     header = f"💬 {user.first_name or 'Не указано'} ({username}):"
 
     keyboard = [
-        [InlineKeyboardButton("🔨 Бан/Разбан", callback_data=f"block_{user_chat_id}")]
+        [InlineKeyboardButton("🔨 Дать пизды/помиловать", callback_data=f"block_{user_chat_id}")]
     ]
 
     try:
