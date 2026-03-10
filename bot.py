@@ -490,7 +490,7 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if is_user_blocked(user_chat_id):
-        await message.reply_text("🚫 Этот пацан на нарах, до него не доходит")
+        await message.reply_text("🚫 Этот пацан закосплеил тандера и улетел в бан, твои сообщения ему не приходят")
         return
 
     try:
@@ -528,9 +528,9 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         user_info = f"Пацан {target_user_id}"
 
     if is_blocked_now:
-        text = f"🚔 {user_info} поехал на нары"
+        text = f"🚔 {user_info} решил закосплеить тандера и улетел в бан"
     else:
-        text = f"🕊 {user_info} откинулся, добро пожаловать на волю"
+        text = f"🕊 {user_info} получил священный разбан"
 
     await context.bot.send_message(
         chat_id=query.message.chat_id,
