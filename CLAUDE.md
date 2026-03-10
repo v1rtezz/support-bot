@@ -16,21 +16,23 @@ python bot.py
 
 Requires `.env` with: `TELEGRAM_TOKEN`, `SUPPORT_CHAT_ID` (supergroup with forum topics enabled).
 
+Production: `./deploy.sh` creates a systemd service.
+
 ## Architecture
 
-Single-file bot (`bot.py`, ~870 lines) using `python-telegram-bot` v20.8 (async). SQLite database (`support_bot.db`) created at startup.
+Single-file bot (`bot.py`, ~500 lines) using `python-telegram-bot` v20.8 (async). SQLite database (`support_bot.db`) created at startup.
 
 **Key concepts:**
-- **Per-user topics**: Each user gets a dedicated forum topic in the support supergroup. Topic names show status emoji (🟢 open / 🔴 closed). Closed tickets reuse existing topics on reopen.
+- **Per-user topics**: Each user gets a dedicated forum topic. Topic is created once and reused forever.
 - **Message mapping**: `messages_mapping` table links user messages to support chat messages for reply routing. Indexed by `support_message_id`.
-- **Topic-based routing**: Operator messages route to users via reply mapping OR by `message_thread_id` → ticket lookup (so messages without explicit reply also forward).
-- **Entity preservation**: `_shift_entities()` shifts message entities (including `CUSTOM_EMOJI`) when prepending headers. `copy_message()` handles all media types with proper entity forwarding.
+- **Topic-based routing**: Operator messages route to users via reply mapping OR by `message_thread_id` → `user_topics` lookup (messages without explicit reply also forward).
+- **Entity preservation**: `_shift_entities()` shifts message entities (including `CUSTOM_EMOJI`) when prepending headers. `copy_message()` handles all media types.
 
-**DB tables**: `messages_mapping`, `tickets`, `blocked_users`
+**DB tables**: `messages_mapping`, `user_topics`, `blocked_users`
 
-**Compatibility**: Uses `from __future__ import annotations` for Python 3.9 support. Uses `zoneinfo.ZoneInfo` (stdlib) for Moscow timezone.
+**Compatibility**: Uses `from __future__ import annotations` for Python 3.9 support.
 
 ## Bot Commands
 
 - User-facing: `/start`, `/help`
-- Operator (support chat): `/open_tickets`, `/close` (reply), `/reopen` (reply), `/ticket` (reply)
+- No operator commands — operators just write in the user's topic

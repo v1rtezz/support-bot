@@ -4,8 +4,6 @@ import sqlite3
 import logging
 import os
 import sys
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -47,9 +45,6 @@ except ValueError:
     logger.error(f"SUPPORT_CHAT_ID должен быть числом, получено: {_support_chat_id}")
     sys.exit(1)
 
-# Временная зона МСК
-MSK = ZoneInfo("Europe/Moscow")
-
 conn = sqlite3.connect("support_bot.db", check_same_thread=False)
 
 # ---- таблица маппинга сообщений ----
@@ -59,13 +54,11 @@ CREATE TABLE IF NOT EXISTS messages_mapping (
     user_chat_id       INTEGER,
     user_message_id    INTEGER,
     support_message_id INTEGER,
-    ticket_id          INTEGER,
     PRIMARY KEY(user_chat_id, user_message_id)
 )
 """
 )
 
-# ---- индекс для поиска по support_message_id ----
 conn.execute(
     """
 CREATE INDEX IF NOT EXISTS idx_support_message_id
@@ -73,18 +66,14 @@ ON messages_mapping (support_message_id)
 """
 )
 
-# ---- таблица тикетов ----
+# ---- таблица связей пользователь → топик ----
 conn.execute(
     """
-CREATE TABLE IF NOT EXISTS tickets (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_chat_id   INTEGER NOT NULL,
-    username       TEXT,
-    first_name     TEXT,
-    status         TEXT NOT NULL DEFAULT 'open',
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL,
-    topic_id       INTEGER
+CREATE TABLE IF NOT EXISTS user_topics (
+    user_chat_id INTEGER PRIMARY KEY,
+    topic_id     INTEGER NOT NULL,
+    username     TEXT,
+    first_name   TEXT
 )
 """
 )
@@ -104,38 +93,19 @@ conn.commit()
 
 
 # Дефолтные тексты
-DEFAULT_GREETING = (
-    "Здравствуйте!\n\n"
-    "Напишите Ваш вопрос, и мы ответим Вам в ближайшее время.\n\n"
-    "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК"
-)
+DEFAULT_GREETING = "Здравствуйте! Опишите Вашу проблему, и мы постараемся помочь \U0001F917"
 
-DEFAULT_HELP = (
-    "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК\n\n"
-    "📝 Заполняйте тикет внимательно и кратко, но максимально подробно. "
-    "Помните, что это не чат с техподдержкой в реальном времени. Все тикеты обрабатываются в порядке очереди.\n\n"
-    "⌛️ Возможно придётся подождать некоторое время, прежде чем вы получите ответ на свой вопрос."
-)
+# /help — текст + premium emoji (offsets рассчитываются в help_command)
+HELP_TEXT = "\U0001F916 Основной бот — @virtezvpn_bot\n\U0001F49A Отзывы — @virtezvpn_feedback\n\U0001F4CC Новости — @virtezvpn"
+
+FIRST_MESSAGE_TEXT = "Мы получили Ваше сообщение и скоро ответим \U0001F4AC"
 
 MAX_CAPTION_LENGTH = 1024
 MAX_MESSAGE_LENGTH = 4096
 
 
 # ----------------- Утилиты -----------------
-def format_datetime(iso_string: str) -> str:
-    """Конвертирует ISO datetime в читаемый формат МСК"""
-    try:
-        dt = datetime.fromisoformat(iso_string)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_msk = dt.astimezone(MSK)
-        return dt_msk.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return iso_string
-
-
 def truncate(text: str, limit: int) -> str:
-    """Обрезает текст до limit символов, добавляя '…' если обрезан"""
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
@@ -160,11 +130,7 @@ def _shift_entities(entities: tuple[MessageEntity, ...] | None, offset: int) -> 
 
 
 async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
-    """Пересылает сообщение любого типа в указанный чат, сохраняя форматирование и premium emoji.
-
-    caption — header, добавляемый к медиа/тексту (обрезается до лимитов).
-    Entities корректно сдвигаются при добавлении header.
-    """
+    """Пересылает сообщение любого типа в указанный чат, сохраняя форматирование и premium emoji."""
     bot = message.get_bot()
 
     if message.text:
@@ -305,18 +271,18 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
 # ----------------- Работа с БД / Блокировка -----------------
 
 def is_user_blocked(user_chat_id: int) -> bool:
-    """Проверяет, заблокирован ли пользователь"""
     row = conn.execute("SELECT 1 FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,)).fetchone()
     return row is not None
 
 
 def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
-    """Блокирует или разблокирует пользователя."""
+    """Блокирует или разблокирует пользователя. Возвращает True если заблокирован."""
     if is_user_blocked(user_chat_id):
         conn.execute("DELETE FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
         conn.commit()
         return False
     else:
+        from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             "INSERT INTO blocked_users (user_chat_id, blocked_at, admin_id) VALUES (?, ?, ?)",
@@ -326,293 +292,167 @@ def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
         return True
 
 
-# ----------------- Работа с БД / тикетами -----------------
-def get_open_ticket(user_chat_id: int):
-    """Возвращает ID и topic_id открытого тикета пользователя"""
+# ----------------- Работа с БД / топики -----------------
+
+def get_user_topic(user_chat_id: int) -> int | None:
+    """Возвращает topic_id для пользователя или None."""
     row = conn.execute(
-        """
-        SELECT id, topic_id FROM tickets
-        WHERE user_chat_id = ? AND status = 'open'
-        ORDER BY id DESC
-        LIMIT 1
-        """,
+        "SELECT topic_id FROM user_topics WHERE user_chat_id = ?",
         (user_chat_id,),
     ).fetchone()
-    return row if row else None
+    return row[0] if row else None
 
 
-def get_last_closed_ticket(user_chat_id: int):
-    """Возвращает ID и topic_id последнего закрытого тикета пользователя"""
+def get_user_by_topic(topic_id: int) -> int | None:
+    """Возвращает user_chat_id по topic_id."""
     row = conn.execute(
-        """
-        SELECT id, topic_id FROM tickets
-        WHERE user_chat_id = ? AND status = 'closed' AND topic_id IS NOT NULL
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (user_chat_id,),
-    ).fetchone()
-    return row if row else None
-
-
-def get_ticket_by_topic_id(topic_id: int):
-    """Возвращает открытый тикет по topic_id"""
-    row = conn.execute(
-        "SELECT id, user_chat_id FROM tickets WHERE topic_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1",
+        "SELECT user_chat_id FROM user_topics WHERE topic_id = ?",
         (topic_id,),
     ).fetchone()
-    return row if row else None
+    return row[0] if row else None
 
 
-async def create_or_reopen_ticket(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, username: str = None, first_name: str = None) -> tuple:
-    """Создает новый тикет или переоткрывает последний закрытый (переиспользуя топик)."""
-    now = datetime.now(timezone.utc).isoformat()
+def save_user_topic(user_chat_id: int, topic_id: int, username: str | None, first_name: str | None):
+    conn.execute(
+        "INSERT OR REPLACE INTO user_topics (user_chat_id, topic_id, username, first_name) VALUES (?, ?, ?, ?)",
+        (user_chat_id, topic_id, username, first_name),
+    )
+    conn.commit()
 
-    # Пробуем переиспользовать закрытый тикет с существующим топиком
-    closed = get_last_closed_ticket(user_chat_id)
-    if closed:
-        ticket_id, topic_id = closed
-        conn.execute(
-            "UPDATE tickets SET status = 'open', updated_at = ? WHERE id = ?",
-            (now, ticket_id),
-        )
-        conn.commit()
-        await update_topic_status(context, ticket_id, "open")
-        logger.info(f"Переоткрыт тикет #{ticket_id} (топик {topic_id}) для пользователя {user_chat_id}")
-        return ticket_id, topic_id
 
-    # Нет закрытого тикета — создаём новый топик
-    topic_id = None
-    display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
-    topic_name = f"🟢 {display_name}"
+def update_user_info(user_chat_id: int, username: str | None, first_name: str | None):
+    conn.execute(
+        "UPDATE user_topics SET username = ?, first_name = ? WHERE user_chat_id = ?",
+        (username, first_name, user_chat_id),
+    )
+    conn.commit()
+
+
+def save_mapping(user_chat_id: int, user_message_id: int, support_message_id: int):
+    conn.execute(
+        "INSERT OR REPLACE INTO messages_mapping (user_chat_id, user_message_id, support_message_id) VALUES (?, ?, ?)",
+        (user_chat_id, user_message_id, support_message_id),
+    )
+    conn.commit()
+
+
+def find_user_by_support_message(support_message_id: int) -> tuple | None:
+    return conn.execute(
+        "SELECT user_chat_id, user_message_id FROM messages_mapping WHERE support_message_id = ?",
+        (support_message_id,),
+    ).fetchone()
+
+
+async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int, username: str | None, first_name: str | None) -> tuple[int | None, bool]:
+    """Возвращает (topic_id, is_new) для пользователя, создавая топик если нужно."""
+    topic_id = get_user_topic(user_chat_id)
+    if topic_id:
+        update_user_info(user_chat_id, username, first_name)
+        return topic_id, False
+
+    display_name = username or first_name or f"User{user_chat_id}"
+    topic_name = f"💬 {display_name}"
 
     try:
         forum_topic = await context.bot.create_forum_topic(
             chat_id=SUPPORT_CHAT_ID,
-            name=topic_name[:128]
+            name=topic_name[:128],
         )
         topic_id = forum_topic.message_thread_id
         logger.info(f"Создан топик {topic_id} для пользователя {user_chat_id}")
     except Exception as e:
         logger.error(f"Ошибка создания топика: {e}")
+        return None
 
-    conn.execute(
-        """
-        INSERT INTO tickets (user_chat_id, username, first_name, status, created_at, updated_at, topic_id)
-        VALUES (?, ?, ?, 'open', ?, ?, ?)
-        """,
-        (user_chat_id, username, first_name, now, now, topic_id),
+    save_user_topic(user_chat_id, topic_id, username, first_name)
+
+    username_display = f"@{username}" if username else "Не указан"
+    user_info = (
+        f"🫡 <b>Братва, тут новый подъехал</b>\n\n"
+        f"🆔 ID: <code>{user_chat_id}</code>\n"
+        f"👤 Погоняло: {first_name or 'Без имени'}\n"
+        f"📱 Юзер: {username_display}"
     )
-    conn.commit()
-    ticket_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    if topic_id:
-        username_display = f"@{username}" if username else "Не указан"
-        user_info = (
-            f"👤 <b>Информация о пользователе</b>\n\n"
-            f"🆔 ID: <code>{user_chat_id}</code>\n"
-            f"👤 Имя: {first_name or 'Не указано'}\n"
-            f"📱 Username: {username_display}\n"
-            f"🎫 Тикет: #{ticket_id}"
-        )
-        try:
-            # Первое сообщение (закрепляется автоматически) — служебное
-            await context.bot.send_message(
-                chat_id=SUPPORT_CHAT_ID,
-                message_thread_id=topic_id,
-                text="📩 Новое обращение"
-            )
-            # Второе — информация о пользователе (не пропадёт)
-            await context.bot.send_message(
-                chat_id=SUPPORT_CHAT_ID,
-                message_thread_id=topic_id,
-                text=user_info,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка отправки информации о пользователе: {e}")
-
-    return ticket_id, topic_id
-
-
-def update_ticket_status(ticket_id: int, status: str):
-    """Обновляет статус тикета"""
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
-        (status, now, ticket_id),
-    )
-    conn.commit()
-
-
-def touch_ticket(ticket_id: int):
-    """Обновляет updated_at тикета"""
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, ticket_id))
-    conn.commit()
-
-
-def update_ticket_user_info(ticket_id: int, username: str | None, first_name: str | None):
-    """Обновляет username и first_name в тикете"""
-    conn.execute(
-        "UPDATE tickets SET username = ?, first_name = ? WHERE id = ?",
-        (username, first_name, ticket_id),
-    )
-    conn.commit()
-
-
-def get_ticket_status(ticket_id: int) -> str | None:
-    """Возвращает статус тикета"""
-    row = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
-    return row[0] if row else None
-
-
-async def update_topic_status(context: ContextTypes.DEFAULT_TYPE, ticket_id: int, status: str):
-    """Обновляет название топика при изменении статуса"""
-    row = conn.execute(
-        "SELECT topic_id, username, first_name, user_chat_id FROM tickets WHERE id = ?",
-        (ticket_id,),
-    ).fetchone()
-    if not row or not row[0]:
-        return
-
-    topic_id, username, first_name, user_chat_id = row
-
-    status_emoji = "🔴" if status == "closed" else "🟢"
-    display_name = username if username else (first_name if first_name else f"User{user_chat_id}")
-    topic_name = f"{status_emoji} {display_name}"
-
     try:
-        await context.bot.edit_forum_topic(
+        await context.bot.send_message(
             chat_id=SUPPORT_CHAT_ID,
             message_thread_id=topic_id,
-            name=topic_name[:128]
+            text="🚨 Ало, на районе новый залётный",
         )
-        logger.info(f"Обновлено название топика {topic_id} на '{topic_name}'")
+        await context.bot.send_message(
+            chat_id=SUPPORT_CHAT_ID,
+            message_thread_id=topic_id,
+            text=user_info,
+            parse_mode="HTML",
+        )
     except Exception as e:
-        logger.error(f"Ошибка обновления названия топика: {e}")
+        logger.error(f"Ошибка отправки информации о пользователе: {e}")
 
-
-def get_ticket_by_support_message(support_message_id: int):
-    row = conn.execute(
-        "SELECT ticket_id FROM messages_mapping WHERE support_message_id = ?",
-        (support_message_id,),
-    ).fetchone()
-    return row[0] if row else None
-
-
-def save_mapping(user_chat_id, user_message_id, support_message_id, ticket_id):
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO messages_mapping (
-            user_chat_id, user_message_id, support_message_id, ticket_id
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (user_chat_id, user_message_id, support_message_id, ticket_id),
-    )
-    conn.commit()
-
-
-def find_user_by_support_message(support_message_id):
-    return conn.execute(
-        """
-        SELECT user_chat_id, user_message_id, ticket_id
-        FROM messages_mapping
-        WHERE support_message_id = ?
-        """,
-        (support_message_id,),
-    ).fetchone()
-
-
-def get_all_open_tickets(limit: int = 50):
-    return conn.execute(
-        """
-        SELECT id, user_chat_id, username, first_name, created_at, updated_at
-        FROM tickets
-        WHERE status = 'open'
-        ORDER BY updated_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-
-
-def get_user_chat_id_by_ticket(ticket_id: int):
-    row = conn.execute(
-        "SELECT user_chat_id FROM tickets WHERE id = ?",
-        (ticket_id,),
-    ).fetchone()
-    return row[0] if row else None
+    return topic_id, True
 
 
 # ----------------- Хендлеры пользователя -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
-
     await update.message.reply_text(DEFAULT_GREETING)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
-
-    await update.message.reply_text(DEFAULT_HELP)
+    # 🤖 → pos 0 len 2, 💚 → after first \n, 📌 → after second \n
+    line1 = "\U0001F916 Основной бот — @virtezvpn_bot\n"
+    line2 = "\U0001F49A Отзывы — @virtezvpn_feedback\n"
+    entities = [
+        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=0, length=2, custom_emoji_id="5361741454685256344"),
+        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=len(line1), length=2, custom_emoji_id="5337080053119336309"),
+        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=len(line1) + len(line2), length=2, custom_emoji_id="5424818078833715060"),
+    ]
+    await update.message.reply_text(HELP_TEXT, entities=entities)
 
 
 async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     user = message.from_user
     user_chat_id = message.chat_id
-    user_message_id = message.message_id
 
     if is_user_blocked(user_chat_id):
         return
 
-    ticket_data = get_open_ticket(user_chat_id)
+    topic_id, is_new = await get_or_create_topic(context, user_chat_id, user.username, user.first_name)
+    if not topic_id:
+        return
 
-    if ticket_data is None:
-        ticket_id, topic_id = await create_or_reopen_ticket(context, user_chat_id, user.username, user.first_name)
-        await message.reply_text(
-            "Мы получили ваше обращение и скоро ответим \U0001F4AC",
-            entities=[
-                MessageEntity(
-                    type=MessageEntity.CUSTOM_EMOJI,
-                    offset=len("Мы получили ваше обращение и скоро ответим "),
-                    length=2,  # emoji занимает 2 символа (surrogate pair)
-                    custom_emoji_id="5244583512878648726",
-                ),
-            ],
-        )
-    else:
-        ticket_id, topic_id = ticket_data
-
-    # Обновляем данные пользователя на случай если сменились
-    update_ticket_user_info(ticket_id, user.username, user.first_name)
+    if is_new:
+        confirm_text = FIRST_MESSAGE_TEXT
+        confirm_entities = [
+            MessageEntity(
+                type=MessageEntity.CUSTOM_EMOJI,
+                offset=len("Мы получили Ваше сообщение и скоро ответим "),
+                length=2,
+                custom_emoji_id="5244583512878648726",
+            ),
+        ]
+        await message.reply_text(confirm_text, entities=confirm_entities)
 
     username = f"@{user.username}" if user.username else "Не указан"
     header = f"💬 {user.first_name or 'Не указано'} ({username}):"
 
-    send_kwargs = {}
-    if topic_id:
-        send_kwargs["message_thread_id"] = topic_id
-
     keyboard = [
-        [InlineKeyboardButton("❌ Заблокировать/Разблокировать", callback_data=f"block_{user_chat_id}")]
+        [InlineKeyboardButton("🔨 Бан/Разбан", callback_data=f"block_{user_chat_id}")]
     ]
-    send_kwargs["reply_markup"] = InlineKeyboardMarkup(keyboard)
 
     try:
-        sent_message = await copy_message(message, SUPPORT_CHAT_ID, caption=header, **send_kwargs)
-
+        sent_message = await copy_message(
+            message,
+            SUPPORT_CHAT_ID,
+            caption=header,
+            message_thread_id=topic_id,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         if sent_message:
-            save_mapping(
-                user_chat_id,
-                user_message_id,
-                sent_message.message_id,
-                ticket_id,
-            )
+            save_mapping(user_chat_id, message.message_id, sent_message.message_id)
     except Exception as e:
         logger.error(f"Ошибка при пересылке сообщения: {e}")
 
@@ -629,31 +469,26 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user_chat_id = None
-    ticket_id = None
 
     # Способ 1: ответ на конкретное сообщение — ищем по маппингу
     if message.reply_to_message:
         found = find_user_by_support_message(message.reply_to_message.message_id)
         if found:
-            user_chat_id, _, ticket_id = found
+            user_chat_id = found[0]
 
-    # Способ 2: сообщение в топике без reply — ищем тикет по topic_id
+    # Способ 2: сообщение в топике без reply — ищем пользователя по topic_id
     if not user_chat_id and message.message_thread_id:
-        ticket_data = get_ticket_by_topic_id(message.message_thread_id)
-        if ticket_data:
-            ticket_id, user_chat_id = ticket_data
+        user_chat_id = get_user_by_topic(message.message_thread_id)
 
     if not user_chat_id:
         return
 
     if is_user_blocked(user_chat_id):
-        await message.reply_text("⛔️ Этот пользователь заблокирован. Он не получит сообщение.")
+        await message.reply_text("🚫 Этот пацан на нарах, до него не доходит")
         return
 
     try:
         await copy_message(message, user_chat_id)
-        if ticket_id:
-            touch_ticket(ticket_id)
     except Exception as e:
         logger.error(f"Ошибка при отправке ответа пользователю: {e}")
 
@@ -673,166 +508,29 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     admin_id = query.from_user.id
-
     is_blocked_now = toggle_user_block(target_user_id, admin_id)
 
     res = conn.execute(
-        "SELECT username, first_name FROM tickets WHERE user_chat_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT username, first_name FROM user_topics WHERE user_chat_id = ?",
         (target_user_id,),
     ).fetchone()
     if res:
         username, first_name = res
-        username_str = f"@{username}" if username else "без юзернейма"
-        user_info = f"{first_name or 'Пользователь'} ({username_str})"
+        username_str = f"@{username}" if username else "ноунейм"
+        user_info = f"{first_name or 'Пацан'} ({username_str})"
     else:
-        user_info = f"Пользователь {target_user_id}"
+        user_info = f"Пацан {target_user_id}"
 
     if is_blocked_now:
-        text = f"👨 {user_info}\n❗️ Пользователь заблокирован"
+        text = f"🚔 {user_info} поехал на нары"
     else:
-        text = f"👨 {user_info}\n❗️ Пользователь разблокирован"
+        text = f"🕊 {user_info} откинулся, добро пожаловать на волю"
 
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         message_thread_id=query.message.message_thread_id,
-        text=text
+        text=text,
     )
-
-
-# --------- Команды для операторов в чате поддержки ---------
-async def open_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-
-    if message.chat_id != SUPPORT_CHAT_ID:
-        return
-
-    rows = get_all_open_tickets()
-
-    if not rows:
-        await message.reply_text("Открытых тикетов нет ✅")
-        return
-
-    header = "📂 Открытые тикеты:\n\n"
-    blocks = []
-    for ticket_id, user_chat_id, username, first_name, created_at, updated_at in rows:
-        created_fmt = format_datetime(created_at)
-        username_display = f"@{username}" if username else "Не указан"
-        first_name_display = first_name or "Не указано"
-
-        blocks.append(
-            f"🎫 Тикет #{ticket_id}\n"
-            f"👤 {first_name_display}\n"
-            f"📱 {username_display}\n"
-            f"🆔 ID: {user_chat_id}\n"
-            f"📅 Создан: {created_fmt}"
-        )
-
-    # Разбиваем на сообщения по целым блокам
-    current_text = header
-    for block in blocks:
-        candidate = current_text + block + "\n\n"
-        if len(candidate) > MAX_MESSAGE_LENGTH:
-            await message.reply_text(current_text.rstrip())
-            current_text = block + "\n\n"
-        else:
-            current_text = candidate
-
-    if current_text.strip():
-        await message.reply_text(current_text.rstrip())
-
-
-async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if not message.reply_to_message:
-        await message.reply_text("Команду /close нужно вызывать ответом на сообщение тикета.")
-        return
-
-    ticket_id = get_ticket_by_support_message(message.reply_to_message.message_id)
-    if not ticket_id:
-        await message.reply_text("Не удалось определить тикет для этого сообщения.")
-        return
-
-    if get_ticket_status(ticket_id) == "closed":
-        await message.reply_text(f"Тикет #{ticket_id} уже закрыт.")
-        return
-
-    user_chat_id = get_user_chat_id_by_ticket(ticket_id)
-
-    update_ticket_status(ticket_id, "closed")
-    await update_topic_status(context, ticket_id, "closed")
-    await message.reply_text(f"✅ Тикет #{ticket_id} закрыт.")
-
-    if user_chat_id:
-        try:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text="✅ Обращение завершено"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка при отправке уведомления пользователю {user_chat_id}: {e}")
-
-
-async def reopen_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if not message.reply_to_message:
-        await message.reply_text("Команду /reopen нужно вызывать ответом на сообщение тикета.")
-        return
-
-    ticket_id = get_ticket_by_support_message(message.reply_to_message.message_id)
-    if not ticket_id:
-        await message.reply_text("Не удалось определить тикет для этого сообщения.")
-        return
-
-    if get_ticket_status(ticket_id) == "open":
-        await message.reply_text(f"Тикет #{ticket_id} уже открыт.")
-        return
-
-    update_ticket_status(ticket_id, "open")
-    await update_topic_status(context, ticket_id, "open")
-    await message.reply_text(f"♻️ Тикет #{ticket_id} снова открыт.")
-
-
-async def ticket_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message.chat_id != SUPPORT_CHAT_ID:
-        return
-    if not message.reply_to_message:
-        await message.reply_text("Команду /ticket нужно вызывать ответом на сообщение тикета.")
-        return
-
-    ticket_id = get_ticket_by_support_message(message.reply_to_message.message_id)
-    if not ticket_id:
-        await message.reply_text("Не удалось определить тикет для этого сообщения.")
-        return
-
-    row = conn.execute(
-        "SELECT user_chat_id, status, created_at, updated_at FROM tickets WHERE id = ?",
-        (ticket_id,),
-    ).fetchone()
-    if not row:
-        await message.reply_text("Тикет не найден в базе.")
-        return
-
-    user_chat_id, status, created_at, updated_at = row
-    created_fmt = format_datetime(created_at)
-    updated_fmt = format_datetime(updated_at)
-
-    is_blocked = is_user_blocked(user_chat_id)
-    block_status = "ДА ⛔️" if is_blocked else "НЕТ ✅"
-
-    text = (
-        f"📄 Тикет #{ticket_id}\n"
-        f"Пользователь: {user_chat_id}\n"
-        f"Статус тикета: {status}\n"
-        f"Заблокирован: {block_status}\n"
-        f"Создан: {created_fmt}\n"
-        f"Обновлён: {updated_fmt}"
-    )
-    await message.reply_text(text)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -845,13 +543,6 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
 
-    # команды для операторов
-    application.add_handler(CommandHandler("close", close_ticket_cmd))
-    application.add_handler(CommandHandler("reopen", reopen_ticket_cmd))
-    application.add_handler(CommandHandler("ticket", ticket_info_cmd))
-    application.add_handler(CommandHandler("open_tickets", open_tickets_cmd))
-
-    # Обработчик нажатия на кнопку Block/Unblock
     application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_"))
 
     application.add_handler(
