@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import sqlite3
 import logging
 import os
@@ -105,6 +106,11 @@ MAX_MESSAGE_LENGTH = 4096
 
 
 # ----------------- Утилиты -----------------
+def utf16_len(text: str) -> int:
+    """Длина строки в UTF-16 code units (как считает Telegram API)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
 def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -112,7 +118,7 @@ def truncate(text: str, limit: int) -> str:
 
 
 def _shift_entities(entities: tuple[MessageEntity, ...] | None, offset: int) -> list[MessageEntity] | None:
-    """Сдвигает offset всех entities на заданное значение."""
+    """Сдвигает offset всех entities на заданное значение (в UTF-16 units)."""
     if not entities:
         return None
     shifted = []
@@ -137,7 +143,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption:
             prefix = f"{caption}\n\n"
             text = prefix + message.text
-            entities = _shift_entities(message.entities, len(prefix))
+            entities = _shift_entities(message.entities, utf16_len(prefix))
         else:
             text = message.text
             entities = message.entities
@@ -151,7 +157,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -166,7 +172,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -181,7 +187,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -196,7 +202,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -211,7 +217,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -226,7 +232,7 @@ async def copy_message(message, chat_id: int, caption: str = None, **kwargs):
         if caption and message.caption:
             prefix = f"{caption}\n\n"
             full_cap = prefix + message.caption
-            cap_entities = _shift_entities(message.caption_entities, len(prefix))
+            cap_entities = _shift_entities(message.caption_entities, utf16_len(prefix))
         else:
             full_cap = caption or message.caption or ""
             cap_entities = message.caption_entities if not caption else None
@@ -366,11 +372,12 @@ async def get_or_create_topic(context: ContextTypes.DEFAULT_TYPE, user_chat_id: 
 
     save_user_topic(user_chat_id, topic_id, username, first_name)
 
-    username_display = f"@{username}" if username else "Не указан"
+    username_display = f"@{html.escape(username)}" if username else "Не указан"
+    safe_name = html.escape(first_name) if first_name else "аноним"
     user_info = (
-        f"🫡 <b>Досье на челика/b>\n\n"
+        f"🫡 <b>Досье на челика</b>\n\n"
         f"🆔 ID: <code>{user_chat_id}</code>\n"
-        f"👤 По паспорту: {first_name or 'аноним'}\n"
+        f"👤 По паспорту: {safe_name}\n"
         f"📱 Юзер: {username_display}"
     )
     try:
@@ -401,13 +408,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
-    # 🤖 → pos 0 len 2, 💚 → after first \n, 📌 → after second \n
     line1 = "\U0001F916 Основной бот — @virtezvpn_bot\n"
     line2 = "\U0001F49A Отзывы — @virtezvpn_feedback\n"
     entities = [
         MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=0, length=2, custom_emoji_id="5361741454685256344"),
-        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=len(line1), length=2, custom_emoji_id="5337080053119336309"),
-        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=len(line1) + len(line2), length=2, custom_emoji_id="5424818078833715060"),
+        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=utf16_len(line1), length=2, custom_emoji_id="5337080053119336309"),
+        MessageEntity(type=MessageEntity.CUSTOM_EMOJI, offset=utf16_len(line1) + utf16_len(line2), length=2, custom_emoji_id="5424818078833715060"),
     ]
     await update.message.reply_text(HELP_TEXT, entities=entities)
 
@@ -429,7 +435,7 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         confirm_entities = [
             MessageEntity(
                 type=MessageEntity.CUSTOM_EMOJI,
-                offset=len("Мы получили Ваше сообщение и скоро ответим "),
+                offset=utf16_len("Мы получили Ваше сообщение и скоро ответим "),
                 length=2,
                 custom_emoji_id="5244583512878648726",
             ),
